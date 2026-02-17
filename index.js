@@ -26,9 +26,10 @@ Your personality:
 - Never give financial advice disclaimers unless Rod is about to do something genuinely risky
 
 You have access to:
-- Supabase (transactions, subscriptions, goals, debts, paper trades, alerts, conversation history)
+- Supabase (transactions, subscriptions, goals, debts, paper trades, alerts, conversation history, scheduled tasks)
 - Alpaca paper trading API (place trades, check portfolio, get quotes)
 - Full financial toolkit (cashflow analysis, budgeting, debt payoff, goal tracking)
+- Scheduling system (create reminders, schedule research, schedule trades)
 
 What you can do:
 TRANSACTIONS: Log income/expenses, categorize them, find patterns, detect weird spikes, find small leaks
@@ -40,11 +41,14 @@ GOALS: Savings targets, milestone tracking, sinking funds
 BUSINESS: Invoice tracking, expense capture, profit snapshots, tax set-aside, KPI tracking
 INVESTING: Contribution schedules, rebalance alerts, risk guardrails
 PAPER TRADING: Buy/sell stocks, check portfolio, get quotes, track performance
+SCHEDULING: Schedule reminders, research briefs, trade executions at specific times
 FRAUD: Flag unrecognized merchants, large transaction alerts, anomaly detection
 
 Always be specific with numbers. If Rod says "how am I doing", pull real data and tell him exactly.
 
-You remember past conversations. Reference them naturally when relevant.`;
+You remember past conversations. Reference them naturally when relevant.
+
+When Rod asks you to do something at a specific time (like "brief me at 8am" or "execute trade at 9:30am"), use the schedule_task tool to set it up. Confirm what you scheduled.`;
 
 // ============ CONVERSATION HISTORY ============
 
@@ -66,7 +70,48 @@ async function getConversationHistory(userId, limit = 20) {
     .limit(limit);
   
   if (error) return [];
-  return (data || []).reverse(); // Oldest first
+  return (data || []).reverse();
+}
+
+// ============ SCHEDULED TASKS ============
+
+async function scheduleTask(userId, taskType, description, scheduledFor, taskData) {
+  const { error } = await supabase.from('scheduled_tasks').insert({
+    user_id: userId,
+    task_type: taskType,
+    description,
+    scheduled_for: scheduledFor,
+    status: 'pending',
+    task_data: taskData,
+    created_at: new Date().toISOString()
+  });
+  if (error) throw error;
+}
+
+async function getPendingTasks() {
+  const now = new Date().toISOString();
+  const { data, error } = await supabase
+    .from('scheduled_tasks')
+    .select('*')
+    .eq('status', 'pending')
+    .lte('scheduled_for', now)
+    .order('scheduled_for', { ascending: true });
+  if (error) throw error;
+  return data || [];
+}
+
+async function markTaskCompleted(taskId) {
+  await supabase
+    .from('scheduled_tasks')
+    .update({ status: 'completed', completed_at: new Date().toISOString() })
+    .eq('id', taskId);
+}
+
+async function markTaskFailed(taskId) {
+  await supabase
+    .from('scheduled_tasks')
+    .update({ status: 'failed', completed_at: new Date().toISOString() })
+    .eq('id', taskId);
 }
 
 // ============ SUPABASE FUNCTIONS ============
@@ -220,6 +265,20 @@ async function getPortfolioHistory() {
 
 const tools = [
   {
+    name: 'schedule_task',
+    description: 'Schedule a task for a specific time. Use when Rod asks you to do something at a certain time (remind, research, execute trade, etc).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        task_type: { type: 'string', enum: ['reminder', 'research', 'trade', 'alert'], description: 'Type of task' },
+        description: { type: 'string', description: 'What the task is' },
+        scheduled_for: { type: 'string', description: 'ISO timestamp when to execute (e.g., 2026-02-17T08:00:00-05:00)' },
+        task_data: { type: 'object', description: 'Any data needed to execute the task (stock symbol, trade details, etc)' }
+      },
+      required: ['task_type', 'description', 'scheduled_for']
+    }
+  },
+  {
     name: 'log_transaction',
     description: 'Log a transaction (income or expense). Use when Rod mentions spending money, receiving money, or wants to track a purchase.',
     input_schema: {
@@ -237,7 +296,7 @@ const tools = [
   },
   {
     name: 'get_cashflow_summary',
-    description: 'Get cashflow summary including income, expenses, top categories, burn rate. Use when Rod asks how he is doing financially or wants a digest.',
+    description: 'Get cashflow summary including income, expenses, top categories, burn rate.',
     input_schema: {
       type: 'object',
       properties: {
@@ -247,7 +306,7 @@ const tools = [
   },
   {
     name: 'get_transactions',
-    description: 'Get recent transactions. Use when Rod wants to see spending history or find specific transactions.',
+    description: 'Get recent transactions.',
     input_schema: {
       type: 'object',
       properties: {
@@ -272,7 +331,7 @@ const tools = [
   },
   {
     name: 'get_subscriptions',
-    description: 'Get all active subscriptions. Use when Rod wants to review bills or find subscription leaks.',
+    description: 'Get all active subscriptions.',
     input_schema: { type: 'object', properties: {} }
   },
   {
@@ -308,12 +367,12 @@ const tools = [
   },
   {
     name: 'get_debts',
-    description: 'Get all active debts. Use for debt payoff planning.',
+    description: 'Get all active debts.',
     input_schema: { type: 'object', properties: {} }
   },
   {
     name: 'get_portfolio',
-    description: 'Get Alpaca paper trading portfolio — account value, positions, buying power.',
+    description: 'Get Alpaca paper trading portfolio.',
     input_schema: { type: 'object', properties: {} }
   },
   {
@@ -322,18 +381,18 @@ const tools = [
     input_schema: {
       type: 'object',
       properties: {
-        symbol: { type: 'string', description: 'Stock ticker symbol e.g. AAPL, TSLA' }
+        symbol: { type: 'string', description: 'Stock ticker symbol' }
       },
       required: ['symbol']
     }
   },
   {
     name: 'place_paper_trade',
-    description: 'Place a paper trade order on Alpaca. Use when Rod wants to buy or sell a stock.',
+    description: 'Place a paper trade order on Alpaca.',
     input_schema: {
       type: 'object',
       properties: {
-        symbol: { type: 'string', description: 'Stock ticker symbol' },
+        symbol: { type: 'string', description: 'Stock ticker' },
         side: { type: 'string', enum: ['buy', 'sell'] },
         qty: { type: 'number', description: 'Number of shares' }
       },
@@ -342,20 +401,23 @@ const tools = [
   },
   {
     name: 'get_portfolio_history',
-    description: 'Get portfolio performance history over the last month.',
+    description: 'Get portfolio performance history.',
     input_schema: { type: 'object', properties: {} }
   },
   {
     name: 'get_paper_trades',
-    description: 'Get recent paper trade history from Supabase.',
+    description: 'Get recent paper trade history.',
     input_schema: { type: 'object', properties: {} }
   }
 ];
 
 // ============ TOOL PROCESSOR ============
 
-async function processTool(name, input) {
+async function processTool(name, input, userId) {
   switch (name) {
+    case 'schedule_task':
+      await scheduleTask(userId, input.task_type, input.description, input.scheduled_for, input.task_data || {});
+      return { scheduled: true, type: input.task_type, when: input.scheduled_for };
     case 'log_transaction':
       await logTransaction(input.date, input.amount, input.merchant, input.category, input.type, input.notes);
       return { logged: true };
@@ -399,10 +461,7 @@ async function processTool(name, input) {
 // ============ CLAUDE LOOP ============
 
 async function runBot(userId, userMessage) {
-  // Load conversation history
   const history = await getConversationHistory(userId);
-  
-  // Build messages array with history + new message
   const messages = [
     ...history.map(h => ({ role: h.role, content: h.content })),
     { role: 'user', content: userMessage }
@@ -421,7 +480,7 @@ async function runBot(userId, userMessage) {
     for (const block of response.content.filter(b => b.type === 'tool_use')) {
       let result;
       try {
-        result = await processTool(block.name, block.input);
+        result = await processTool(block.name, block.input, userId);
       } catch (err) {
         result = { error: err.message };
       }
@@ -443,13 +502,52 @@ async function runBot(userId, userMessage) {
   }
 
   const finalText = response.content.find(b => b.type === 'text')?.text || "Something went wrong, try again!";
-
-  // Save this exchange to history
   await saveMessage(userId, 'user', userMessage);
   await saveMessage(userId, 'assistant', finalText);
-
   return finalText;
 }
+
+// ============ TASK EXECUTOR ============
+
+async function executeTask(task) {
+  try {
+    const userId = task.user_id;
+    let message = '';
+
+    if (task.task_type === 'reminder') {
+      message = `⏰ Reminder: ${task.description}`;
+    } else if (task.task_type === 'research') {
+      const data = task.task_data;
+      if (data.symbol) {
+        const quote = await getStockQuote(data.symbol);
+        message = `📊 Research Brief: ${data.symbol}\n\nCurrent Price: $${quote.p}\n\n${task.description}`;
+      } else {
+        message = `📊 ${task.description}`;
+      }
+    } else if (task.task_type === 'trade') {
+      const data = task.task_data;
+      const order = await placePaperTrade(data.symbol, data.side, data.qty);
+      await savePaperTrade(data.symbol, data.side, data.qty, null, order.status, order.id, `Scheduled trade`);
+      message = `✅ Trade executed: ${data.side.toUpperCase()} ${data.qty} shares of ${data.symbol}\nOrder ID: ${order.id}\nStatus: ${order.status}`;
+    } else if (task.task_type === 'alert') {
+      message = `🚨 Alert: ${task.description}`;
+    }
+
+    await bot.telegram.sendMessage(userId, message);
+    await markTaskCompleted(task.id);
+  } catch (err) {
+    console.error('Task execution failed:', err);
+    await markTaskFailed(task.id);
+  }
+}
+
+// Task checker runs every minute
+setInterval(async () => {
+  const tasks = await getPendingTasks();
+  for (const task of tasks) {
+    await executeTask(task);
+  }
+}, 60000); // Check every 60 seconds
 
 // ============ BOT COMMANDS ============
 
@@ -497,7 +595,7 @@ bot.command('cashflow', async (ctx) => {
 });
 
 bot.start((ctx) => {
-  ctx.reply("Hey Rod 👋 I'm your money bot. I track your cash, manage finances, and paper trade stocks.\n\nCommands:\n/portfolio — check your paper trades\n/cashflow — 30-day money summary\n/opus — switch to full power mode\n/sonnet — switch back to balanced\n\nOr just talk to me naturally.");
+  ctx.reply("Hey Rod 👋 I'm your money bot. I track your cash, manage finances, and paper trade stocks.\n\nCommands:\n/portfolio — check your paper trades\n/cashflow — 30-day money summary\n/opus — switch to full power mode\n/sonnet — switch back to balanced\n\nOr just talk to me naturally. I can schedule tasks too — just tell me what you need and when.");
 });
 
 bot.on('text', async (ctx) => {
@@ -518,6 +616,6 @@ bot.on('text', async (ctx) => {
   }
 });
 
-bot.launch().then(() => console.log('Money bot is running!'));
+bot.launch().then(() => console.log('Money bot is running with scheduler!'));
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
