@@ -26,7 +26,7 @@ Your personality:
 - Never give financial advice disclaimers unless Rod is about to do something genuinely risky
 
 You have access to:
-- Supabase (transactions, subscriptions, goals, debts, paper trades, alerts)
+- Supabase (transactions, subscriptions, goals, debts, paper trades, alerts, conversation history)
 - Alpaca paper trading API (place trades, check portfolio, get quotes)
 - Full financial toolkit (cashflow analysis, budgeting, debt payoff, goal tracking)
 
@@ -42,7 +42,32 @@ INVESTING: Contribution schedules, rebalance alerts, risk guardrails
 PAPER TRADING: Buy/sell stocks, check portfolio, get quotes, track performance
 FRAUD: Flag unrecognized merchants, large transaction alerts, anomaly detection
 
-Always be specific with numbers. If Rod says "how am I doing", pull real data and tell him exactly.`;
+Always be specific with numbers. If Rod says "how am I doing", pull real data and tell him exactly.
+
+You remember past conversations. Reference them naturally when relevant.`;
+
+// ============ CONVERSATION HISTORY ============
+
+async function saveMessage(userId, role, content) {
+  await supabase.from('conversation_history').insert({
+    user_id: userId,
+    role,
+    content,
+    created_at: new Date().toISOString()
+  });
+}
+
+async function getConversationHistory(userId, limit = 20) {
+  const { data, error } = await supabase
+    .from('conversation_history')
+    .select('role, content')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+  
+  if (error) return [];
+  return (data || []).reverse(); // Oldest first
+}
 
 // ============ SUPABASE FUNCTIONS ============
 
@@ -373,8 +398,15 @@ async function processTool(name, input) {
 
 // ============ CLAUDE LOOP ============
 
-async function runBot(userMessage) {
-  const messages = [{ role: 'user', content: userMessage }];
+async function runBot(userId, userMessage) {
+  // Load conversation history
+  const history = await getConversationHistory(userId);
+  
+  // Build messages array with history + new message
+  const messages = [
+    ...history.map(h => ({ role: h.role, content: h.content })),
+    { role: 'user', content: userMessage }
+  ];
 
   let response = await anthropic.messages.create({
     model: currentModel,
@@ -410,7 +442,13 @@ async function runBot(userMessage) {
     });
   }
 
-  return response.content.find(b => b.type === 'text')?.text || "Something went wrong, try again!";
+  const finalText = response.content.find(b => b.type === 'text')?.text || "Something went wrong, try again!";
+
+  // Save this exchange to history
+  await saveMessage(userId, 'user', userMessage);
+  await saveMessage(userId, 'assistant', finalText);
+
+  return finalText;
 }
 
 // ============ BOT COMMANDS ============
@@ -463,9 +501,10 @@ bot.start((ctx) => {
 });
 
 bot.on('text', async (ctx) => {
+  const userId = ctx.from.id.toString();
   await ctx.sendChatAction('typing');
   try {
-    const reply = await runBot(ctx.message.text);
+    const reply = await runBot(userId, ctx.message.text);
     if (reply.length > 4000) {
       for (const chunk of reply.match(/.{1,4000}/gs) || []) {
         await ctx.reply(chunk);
