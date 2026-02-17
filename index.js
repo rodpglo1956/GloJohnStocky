@@ -28,6 +28,7 @@ Your personality:
 You have access to:
 - Supabase (transactions, subscriptions, goals, debts, paper trades, alerts, conversation history, scheduled tasks)
 - Alpaca paper trading API (place trades, check portfolio, get quotes)
+- Hannah's research (she does web searches and saves findings you can access)
 - Full financial toolkit (cashflow analysis, budgeting, debt payoff, goal tracking)
 - Scheduling system (create reminders, schedule research, schedule trades)
 
@@ -42,13 +43,16 @@ BUSINESS: Invoice tracking, expense capture, profit snapshots, tax set-aside, KP
 INVESTING: Contribution schedules, rebalance alerts, risk guardrails
 PAPER TRADING: Buy/sell stocks, check portfolio, get quotes, track performance
 SCHEDULING: Schedule reminders, research briefs, trade executions at specific times
+RESEARCH: Access Hannah's research findings on stocks, news, and market analysis
 FRAUD: Flag unrecognized merchants, large transaction alerts, anomaly detection
 
 Always be specific with numbers. If Rod says "how am I doing", pull real data and tell him exactly.
 
 You remember past conversations. Reference them naturally when relevant.
 
-When Rod asks you to do something at a specific time (like "brief me at 8am" or "execute trade at 9:30am"), use the schedule_task tool to set it up. Confirm what you scheduled.`;
+When Rod asks you to do something at a specific time (like "brief me at 8am" or "execute trade at 9:30am"), use the schedule_task tool to set it up. Confirm what you scheduled.
+
+When Rod mentions checking Hannah's research or needs info for a trade, use get_hannah_research to pull her findings.`;
 
 // ============ CONVERSATION HISTORY ============
 
@@ -229,6 +233,19 @@ async function saveAlert(type, message) {
   if (error) throw error;
 }
 
+// Get research from Hannah's research_artifacts
+async function getHannahResearch(query) {
+  const { data, error } = await supabase
+    .from('research_artifacts')
+    .select('*')
+    .eq('bot_name', 'Hannah')
+    .or(`query.ilike.%${query}%,task.ilike.%${query}%,findings.ilike.%${query}%`)
+    .order('created_at', { ascending: false })
+    .limit(5);
+  if (error) throw error;
+  return data || [];
+}
+
 // ============ ALPACA FUNCTIONS ============
 
 async function getPortfolio() {
@@ -276,6 +293,17 @@ const tools = [
         task_data: { type: 'object', description: 'Any data needed to execute the task (stock symbol, trade details, etc)' }
       },
       required: ['task_type', 'description', 'scheduled_for']
+    }
+  },
+  {
+    name: 'get_hannah_research',
+    description: "Get research that Hannah has done. Use when Rod mentions checking Hannah's research or when you need info for a trade that Hannah researched.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Topic or stock symbol to search Hannah\'s research' }
+      },
+      required: ['query']
     }
   },
   {
@@ -418,6 +446,8 @@ async function processTool(name, input, userId) {
     case 'schedule_task':
       await scheduleTask(userId, input.task_type, input.description, input.scheduled_for, input.task_data || {});
       return { scheduled: true, type: input.task_type, when: input.scheduled_for };
+    case 'get_hannah_research':
+      return await getHannahResearch(input.query);
     case 'log_transaction':
       await logTransaction(input.date, input.amount, input.merchant, input.category, input.type, input.notes);
       return { logged: true };
@@ -547,7 +577,7 @@ setInterval(async () => {
   for (const task of tasks) {
     await executeTask(task);
   }
-}, 60000); // Check every 60 seconds
+}, 60000);
 
 // ============ BOT COMMANDS ============
 
@@ -595,7 +625,7 @@ bot.command('cashflow', async (ctx) => {
 });
 
 bot.start((ctx) => {
-  ctx.reply("Hey Rod 👋 I'm your money bot. I track your cash, manage finances, and paper trade stocks.\n\nCommands:\n/portfolio — check your paper trades\n/cashflow — 30-day money summary\n/opus — switch to full power mode\n/sonnet — switch back to balanced\n\nOr just talk to me naturally. I can schedule tasks too — just tell me what you need and when.");
+  ctx.reply("Hey Rod 👋 I'm your money bot. I track your cash, manage finances, and paper trade stocks.\n\nCommands:\n/portfolio — check your paper trades\n/cashflow — 30-day money summary\n/opus — switch to full power mode\n/sonnet — switch back to balanced\n\nOr just talk to me naturally. I can schedule tasks and access Hannah's research too — just tell me what you need and when.");
 });
 
 bot.on('text', async (ctx) => {
@@ -616,6 +646,6 @@ bot.on('text', async (ctx) => {
   }
 });
 
-bot.launch().then(() => console.log('Money bot is running with scheduler!'));
+bot.launch().then(() => console.log('Money bot is running with scheduler and Hannah integration!'));
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
