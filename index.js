@@ -975,6 +975,37 @@ setInterval(async () => {
   for (const task of tasks) await executeTask(task);
 }, 60000);
 
+// Background message checker - checks for Hannah's messages every 30 seconds
+let lastCheckedMessageId = null;
+const ROD_USER_ID = process.env.ROD_USER_ID || '7779678367'; // Rod's Telegram ID
+
+setInterval(async () => {
+  try {
+    const hannahMessages = await checkHannahMessages();
+    
+    if (hannahMessages.length > 0) {
+      // Only notify about new messages we haven't seen before
+      const newMessages = lastCheckedMessageId 
+        ? hannahMessages.filter(m => m.id !== lastCheckedMessageId)
+        : hannahMessages;
+      
+      if (newMessages.length > 0) {
+        for (const msg of newMessages) {
+          await bot.telegram.sendMessage(
+            ROD_USER_ID,
+            `📬 Message from Hannah:\n\n${msg.message.substring(0, 500)}${msg.message.length > 500 ? '...' : ''}`
+          ).catch(err => console.error('Failed to notify:', err));
+        }
+        
+        // Remember the last message ID we've notified about
+        lastCheckedMessageId = hannahMessages[0].id;
+      }
+    }
+  } catch (err) {
+    console.error('Message check failed:', err);
+  }
+}, 30000); // Check every 30 seconds
+
 // Commands
 bot.command('opus', (ctx) => {
   currentModel = 'claude-opus-4-5-20251101';
