@@ -1653,6 +1653,14 @@ setInterval(async () => {
   }
 }, 30000); // Check every 30 seconds
 
+// Auth middleware - only Rod can use this bot
+bot.use((ctx, next) => {
+  if (ctx.from && ctx.from.id.toString() !== ROD_USER_ID) {
+    return; // Silently ignore non-Rod users
+  }
+  return next();
+});
+
 // Commands
 bot.command('opus', (ctx) => {
   currentModel = 'claude-opus-4-5-20251101';
