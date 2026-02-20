@@ -69,6 +69,7 @@ If you catch yourself using third person, STOP and rewrite in first person.
 - Risk management and position sizing
 
 **DATA ACCESS:**
+- Brave web search (real-time web lookups, news, research)
 - Real-time market data (stocks, options, crypto)
 - News alerts and sentiment analysis
 - Earnings calendars and reports
@@ -567,6 +568,54 @@ async function browserLogin(url, username, password) {
   await page.keyboard.press('Enter');
   await page.waitForNavigation({ waitUntil: 'networkidle2' });
   return { success: true, message: 'Logged in successfully', currentUrl: page.url() };
+}
+
+// ============ BRAVE WEB SEARCH ============
+
+async function braveSearch(query) {
+  const response = await fetch(
+    `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5`,
+    {
+      headers: {
+        'Accept': 'application/json',
+        'X-Subscription-Token': process.env.BRAVE_SEARCH_API_KEY
+      }
+    }
+  );
+  if (!response.ok) throw new Error(`Brave search failed: ${response.status}`);
+  const data = await response.json();
+  return (data.web?.results || []).map(r => ({
+    title: r.title,
+    url: r.url,
+    description: r.description
+  }));
+}
+
+// ============ GITHUB DELETE FILE ============
+
+async function githubDeleteFile(path, message) {
+  const owner = process.env.GITHUB_OWNER || 'rodpglo1956';
+  const repo = process.env.GITHUB_REPO || 'GloJohnStocky';
+
+  try {
+    const { data: file } = await github.rest.repos.getContent({
+      owner,
+      repo,
+      path
+    });
+
+    await github.rest.repos.deleteFile({
+      owner,
+      repo,
+      path,
+      message: message || `Delete ${path}`,
+      sha: file.sha
+    });
+
+    return { action: 'deleted', path };
+  } catch (error) {
+    throw new Error(`GitHub delete failed: ${error.message}`);
+  }
 }
 
 // ============ TRADING DATA FUNCTIONS ============
@@ -1128,6 +1177,29 @@ const tools = [
     }
   },
   {
+    name: 'github_delete_file',
+    description: 'Delete a file from GitHub.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'File path to delete' },
+        commit_message: { type: 'string', description: 'Commit message for the deletion' }
+      },
+      required: ['path', 'commit_message']
+    }
+  },
+  {
+    name: 'brave_search',
+    description: 'Search the web using Brave Search. Use for real-time market news, company research, or any web lookup.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search query' }
+      },
+      required: ['query']
+    }
+  },
+  {
     name: 'browser_navigate',
     description: 'Navigate browser to a URL.',
     input_schema: {
@@ -1343,6 +1415,10 @@ async function processTool(name, input, userId) {
   if (name === 'github_create_file') return await githubCreateOrUpdateFile(input.path, input.content, input.commit_message);
   if (name === 'github_read_file') return await githubReadFile(input.path);
   if (name === 'github_list_files') return await githubListFiles(input.path || '');
+  if (name === 'github_delete_file') return await githubDeleteFile(input.path, input.commit_message);
+
+  // Web search
+  if (name === 'brave_search') return await braveSearch(input.query);
 
   // Browser automation
   if (name === 'browser_navigate') return await browserNavigate(input.url, input.wait_for_selector);
