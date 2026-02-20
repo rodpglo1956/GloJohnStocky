@@ -82,9 +82,15 @@ If you catch yourself using third person, STOP and rewrite in first person.
 - Strategy backtesting
 - Paper trading for testing strategies
 
+**MEDIA & AI:**
+- Image generation (DALL-E via OpenRouter)
+- Multi-model AI chat (any model via OpenRouter)
+- Voice transcription (Whisper - Rod can send voice messages 🎤)
+- Chart/image analysis (Claude Vision - Rod can send screenshots 📸)
+
 **COMMUNICATION:**
 - Bot-to-bot messaging with Hannah (coordinate research and trades)
-- Supabase database (save trades, strategies, alerts)
+- Supabase database (save trades, strategies, alerts, freeform queries)
 - GitHub access (can modify your own code to add capabilities)
 
 # SELF-MODIFICATION SYSTEM
@@ -1602,8 +1608,266 @@ bot.command('reset', async (ctx) => {
   ctx.reply("✅ History cleared.");
 });
 
+bot.command('status', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  await ctx.sendChatAction('typing');
+
+  try {
+    const now = new Date();
+    const marketOpen = isMarketHours(now);
+
+    // Gather stats
+    const [historyRes, tasksRes, tradesRes, credsRes] = await Promise.all([
+      supabase.from('conversation_history').select('id', { count: 'exact', head: true }).eq('bot_name', 'JohnStocky'),
+      supabase.from('scheduled_tasks').select('id, status', { count: 'exact' }).eq('bot_name', 'JohnStocky'),
+      supabase.from('trades').select('id', { count: 'exact', head: true }),
+      supabase.from('shared_memory').select('key').like('key', 'credential_%')
+    ]);
+
+    const msgCount = historyRes.count || 0;
+    const tasks = tasksRes.data || [];
+    const pendingTasks = tasks.filter(t => t.status === 'pending').length;
+    const tradeCount = tradesRes.count || 0;
+    const creds = (credsRes.data || []).map(c => c.key.replace('credential_', '').toUpperCase());
+
+    // Try to get Alpaca account info
+    let accountInfo = '';
+    try {
+      const account = await alpacaGetAccount();
+      if (account && !account.error) {
+        accountInfo = `\n💰 **Alpaca Account:**
+• Buying Power: $${parseFloat(account.buying_power || 0).toLocaleString()}
+• Portfolio Value: $${parseFloat(account.portfolio_value || 0).toLocaleString()}
+• Cash: $${parseFloat(account.cash || 0).toLocaleString()}
+• Day Trades: ${account.daytrade_count || 0}/3`;
+      }
+    } catch (e) { /* Alpaca not configured */ }
+
+    const uptime = process.uptime();
+    const hours = Math.floor(uptime / 3600);
+    const mins = Math.floor((uptime % 3600) / 60);
+
+    const status = `📊 **JOHN STOCKY STATUS DASHBOARD**
+
+${marketOpen ? '🟢 **Market OPEN**' : '🔴 **Market CLOSED**'} | Uptime: ${hours}h ${mins}m
+🧠 Model: ${currentModel}
+🌐 Browser: ${browser ? 'Active 🟢' : 'Idle ⚪'}
+
+📈 **Stats:**
+• Messages processed: ${msgCount}
+• Trades logged: ${tradeCount}
+• Scheduled tasks: ${pendingTasks} pending
+${accountInfo}
+
+🔑 **Credentials:** ${creds.length > 0 ? creds.join(', ') : 'None set'}
+
+🛠️ **Capabilities:**
+• Real-time quotes (Alpha Vantage)
+• Technical analysis (RSI, MACD, SMA, BBANDS)
+• Crypto prices (CoinGecko)
+• Stock news (NewsAPI)
+• Paper trading (Alpaca)
+• Browser automation (Puppeteer)
+• Image generation (DALL-E)
+• Multi-model AI chat (OpenRouter)
+• Voice transcription (Whisper)
+• Chart/image analysis (Claude Vision)
+• Database queries (Supabase)
+• Bot-to-bot communication
+• Self-modification
+
+Type /help for all commands.`;
+
+    await ctx.reply(status, { parse_mode: 'Markdown' });
+  } catch (err) {
+    console.error('Status error:', err);
+    await ctx.reply("🟢 John Stocky is online and operational!\nMarket: " + (isMarketHours(new Date()) ? 'OPEN 🟢' : 'CLOSED 🔴') + "\nModel: " + currentModel);
+  }
+});
+
+bot.command('portfolio', async (ctx) => {
+  await ctx.sendChatAction('typing');
+  try {
+    const [account, positions] = await Promise.all([alpacaGetAccount(), alpacaGetPositions()]);
+
+    if (account.error || positions.error) {
+      return ctx.reply("⚠️ Alpaca not configured. Use: /setcred ALPACA_KEY your_key and /setcred ALPACA_SECRET your_secret");
+    }
+
+    let msg = `💼 **PORTFOLIO SUMMARY**\n\n`;
+    msg += `💰 Portfolio Value: $${parseFloat(account.portfolio_value || 0).toLocaleString()}\n`;
+    msg += `💵 Cash: $${parseFloat(account.cash || 0).toLocaleString()}\n`;
+    msg += `🔥 Buying Power: $${parseFloat(account.buying_power || 0).toLocaleString()}\n\n`;
+
+    if (Array.isArray(positions) && positions.length > 0) {
+      msg += `📊 **Open Positions (${positions.length}):**\n`;
+      for (const p of positions) {
+        const pnl = parseFloat(p.unrealized_pl || 0);
+        const pnlPct = parseFloat(p.unrealized_plpc || 0) * 100;
+        const emoji = pnl >= 0 ? '🟢' : '🔴';
+        msg += `${emoji} **${p.symbol}** — ${p.qty} shares @ $${parseFloat(p.avg_entry_price).toFixed(2)} | P&L: $${pnl.toFixed(2)} (${pnlPct.toFixed(1)}%)\n`;
+      }
+    } else {
+      msg += `No open positions.`;
+    }
+
+    await ctx.reply(msg, { parse_mode: 'Markdown' });
+  } catch (err) {
+    console.error('Portfolio error:', err);
+    await ctx.reply("Couldn't fetch portfolio. Make sure Alpaca credentials are set.");
+  }
+});
+
+bot.command('market', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  await ctx.sendChatAction('typing');
+
+  try {
+    const reply = await runJohn(userId, 'Give me a quick market overview: What are SPY, QQQ, and BTC doing right now? Include price, % change, and a brief sentiment take. Keep it concise.');
+    if (reply.length > 4000) {
+      for (const chunk of reply.match(/.{1,4000}/gs) || []) await ctx.reply(chunk);
+    } else {
+      await ctx.reply(reply);
+    }
+  } catch (err) {
+    await ctx.reply("Couldn't fetch market overview. Try again.");
+  }
+});
+
+bot.command('help', (ctx) => {
+  ctx.reply(`📖 **JOHN STOCKY COMMANDS**
+
+/status — Dashboard with account & capabilities
+/portfolio — Quick portfolio view (Alpaca)
+/market — Quick market overview (SPY, QQQ, BTC)
+/opus — Switch to full-power Opus model
+/sonnet — Switch to balanced Sonnet model
+/reset — Clear conversation history
+/setcred — Store API key: /setcred SERVICE key
+/listcreds — View stored credentials
+/help — Show this message
+
+**Just talk to me for:**
+• Stock quotes & technical analysis
+• Place trades (Alpaca paper/live)
+• Crypto prices & news
+• Chart analysis (send me screenshots 📸)
+• Voice commands 🎤
+• Automated trading strategies`, { parse_mode: 'Markdown' });
+});
+
 bot.start((ctx) => {
-  ctx.reply("John Stocky here 📈 Your elite trading assistant.\n\nI handle stocks, options, crypto, technical analysis, automated strategies, and more.\n\nCommands:\n/setcred - Add API keys\n/listcreds - View stored credentials\n/opus - Full power mode\n/sonnet - Balanced mode\n/reset - Clear history\n\nOr just talk to me. I coordinate with Hannah and execute trades on command.");
+  ctx.reply("John Stocky here 📈 Your elite trading assistant.\n\nI handle stocks, options, crypto, technical analysis, automated strategies, and more.\n\nType /status for my dashboard or /help for all commands.\n\nCommands:\n/status - Full dashboard\n/portfolio - Quick portfolio view\n/market - Market overview\n/setcred - Add API keys\n/listcreds - View stored credentials\n/opus - Full power mode\n/sonnet - Balanced mode\n/reset - Clear history\n\nOr just talk to me. Send voice messages 🎤 or chart screenshots 📸 — I handle it all.");
+});
+
+// Voice message handler - transcribe and respond
+bot.on('voice', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  await ctx.sendChatAction('typing');
+
+  try {
+    const voice = ctx.message.voice;
+
+    // Download voice file from Telegram
+    const fileLink = await ctx.telegram.getFileLink(voice.file_id);
+    const url = fileLink.href || fileLink;
+    const audioResponse = await axios.get(url, { responseType: 'arraybuffer' });
+    const buffer = Buffer.from(audioResponse.data);
+
+    // Transcribe via OpenRouter/Whisper
+    const apiKey = await getOpenRouterKey();
+    if (!apiKey) {
+      return ctx.reply("Need an OpenRouter API key to transcribe voice messages. Use: /setcred OPENROUTER your_key");
+    }
+
+    await ctx.reply("🎤 Got your voice message, transcribing...");
+
+    const base64Audio = buffer.toString('base64');
+    const transcribeResponse = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
+      model: 'openai/whisper-1',
+      messages: [{ role: 'user', content: [
+        { type: 'text', text: 'Transcribe this audio.' },
+        { type: 'input_audio', input_audio: { data: base64Audio, format: 'ogg' } }
+      ]}]
+    }, {
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' }
+    });
+
+    const transcribed = transcribeResponse.data.choices?.[0]?.message?.content;
+    if (!transcribed) {
+      return ctx.reply("Couldn't transcribe that voice message. Try again or type it out.");
+    }
+
+    // Show Rod what was transcribed
+    await ctx.reply(`📝 Heard: "${transcribed}"`);
+
+    // Process as normal message
+    const reply = await runJohn(userId, `[Voice message from Rod]: ${transcribed}`);
+    if (reply.length > 4000) {
+      for (const chunk of reply.match(/.{1,4000}/gs) || []) await ctx.reply(chunk);
+    } else {
+      await ctx.reply(reply);
+    }
+  } catch (err) {
+    console.error('Voice processing error:', err);
+    await ctx.reply("Had trouble with that voice message. Try sending it again?");
+  }
+});
+
+// Photo handler - analyze images via Claude Vision
+bot.on('photo', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  await ctx.sendChatAction('typing');
+
+  try {
+    // Get the largest photo size
+    const photos = ctx.message.photo;
+    const photo = photos[photos.length - 1];
+
+    // Download the photo
+    const fileLink = await ctx.telegram.getFileLink(photo.file_id);
+    const url = fileLink.href || fileLink;
+    const photoResponse = await axios.get(url, { responseType: 'arraybuffer' });
+    const buffer = Buffer.from(photoResponse.data);
+    const base64Image = buffer.toString('base64');
+
+    const caption = ctx.message.caption || 'Rod sent this image. Describe what you see — if it\'s a chart or financial data, analyze it in detail.';
+
+    await ctx.reply("👁️ Analyzing image...");
+
+    // Call Claude directly with vision
+    const history = await getConversationHistory(userId);
+    const messages = history.map(h => ({ role: h.role, content: h.content }));
+    messages.push({
+      role: 'user',
+      content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Image } },
+        { type: 'text', text: caption }
+      ]
+    });
+
+    const aiResponse = await anthropic.messages.create({
+      model: currentModel,
+      max_tokens: 4096,
+      system: getSystemPrompt(),
+      messages
+    });
+
+    const reply = aiResponse.content.map(b => b.text || '').join('');
+
+    // Save to history
+    await saveMessage(userId, 'user', `[Image sent] ${caption}`);
+    await saveMessage(userId, 'assistant', reply);
+
+    if (reply.length > 4000) {
+      for (const chunk of reply.match(/.{1,4000}/gs) || []) await ctx.reply(chunk);
+    } else {
+      await ctx.reply(reply);
+    }
+  } catch (err) {
+    console.error('Photo analysis error:', err);
+    await ctx.reply("Had trouble analyzing that image. Can you try sending it again?");
+  }
 });
 
 bot.on('text', async (ctx) => {
