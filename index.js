@@ -4,6 +4,8 @@ const { createClient } = require('@supabase/supabase-js');
 const { Octokit } = require('@octokit/rest');
 const axios = require('axios');
 const Alpaca = require('@alpacahq/alpaca-trade-api');
+const puppeteer = require('puppeteer');
+const fs = require('fs').promises;
 
 // Init clients
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
@@ -13,6 +15,10 @@ const github = new Octokit({ auth: process.env.GITHUB_TOKEN });
 
 // Model switcher
 let currentModel = 'claude-sonnet-4-5-20250929';
+
+// Browser instances
+let browser = null;
+let browserPage = null;
 
 // John Stocky's Ultimate System Prompt
 function getSystemPrompt() {
@@ -457,6 +463,104 @@ async function githubListFiles(path = '') {
   } catch (error) {
     throw new Error(`GitHub list failed: ${error.message}`);
   }
+}
+
+// ============ BROWSER AUTOMATION ============
+
+async function ensureBrowser() {
+  if (!browser) {
+    browser = await puppeteer.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+    });
+  }
+  if (!browserPage) {
+    browserPage = await browser.newPage();
+    await browserPage.setViewport({ width: 1920, height: 1080 });
+  }
+  return browserPage;
+}
+
+async function browserNavigate(url, waitForSelector = null) {
+  const page = await ensureBrowser();
+  await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+  if (waitForSelector) await page.waitForSelector(waitForSelector, { timeout: 10000 });
+  const title = await page.title();
+  const finalUrl = page.url();
+  return { success: true, url: finalUrl, title, message: `Navigated to ${title} (${finalUrl})` };
+}
+
+async function browserClick(selector, waitForNavigation = false) {
+  const page = await ensureBrowser();
+  try {
+    if (waitForNavigation) {
+      await Promise.all([page.waitForNavigation({ waitUntil: 'networkidle2' }), page.click(selector)]);
+    } else {
+      await page.click(selector);
+    }
+    return { success: true, message: `Clicked ${selector}`, currentUrl: page.url() };
+  } catch (error) { throw new Error(`Click failed: ${error.message}`); }
+}
+
+async function browserType(selector, text, pressEnter = false) {
+  const page = await ensureBrowser();
+  try {
+    await page.waitForSelector(selector, { timeout: 5000 });
+    await page.click(selector);
+    await page.keyboard.type(text, { delay: 50 });
+    if (pressEnter) await page.keyboard.press('Enter');
+    return { success: true, message: `Typed into ${selector}${pressEnter ? ' and pressed Enter' : ''}` };
+  } catch (error) { throw new Error(`Type failed: ${error.message}`); }
+}
+
+async function browserExtractText(selector = null) {
+  const page = await ensureBrowser();
+  if (selector) {
+    try {
+      await page.waitForSelector(selector, { timeout: 5000 });
+      const text = await page.$eval(selector, el => el.textContent);
+      return { success: true, selector, text: text.trim() };
+    } catch (error) { throw new Error(`Extract failed: ${error.message}`); }
+  } else {
+    const text = await page.evaluate(() => document.body.innerText);
+    return { success: true, text: text.trim() };
+  }
+}
+
+async function browserScreenshot(userId, filename = null) {
+  const page = await ensureBrowser();
+  const screenshotPath = filename ? `/tmp/${filename}` : `/tmp/screenshot-${Date.now()}.png`;
+  await page.screenshot({ path: screenshotPath, fullPage: false });
+  return { success: true, path: screenshotPath, message: 'Screenshot saved' };
+}
+
+async function browserClose() {
+  if (browser) {
+    await browser.close();
+    browser = null;
+    browserPage = null;
+    return { success: true, message: 'Browser closed' };
+  }
+  return { success: false, message: 'Browser was not running' };
+}
+
+async function browserLogin(url, username, password) {
+  const page = await ensureBrowser();
+  await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+  const usernameSelectors = ['input[name="username"]', 'input[name="email"]', 'input[type="email"]', 'input[id="username"]', 'input[id="email"]'];
+  const passwordSelectors = ['input[name="password"]', 'input[type="password"]', 'input[id="password"]'];
+  let usernameSelector, passwordSelector;
+  for (const sel of usernameSelectors) { try { await page.waitForSelector(sel, { timeout: 1000 }); usernameSelector = sel; break; } catch (e) { continue; } }
+  for (const sel of passwordSelectors) { try { await page.waitForSelector(sel, { timeout: 1000 }); passwordSelector = sel; break; } catch (e) { continue; } }
+  if (!usernameSelector || !passwordSelector) throw new Error('Could not find login form');
+  await page.waitForSelector(usernameSelector);
+  await page.click(usernameSelector);
+  await page.keyboard.type(username, { delay: 50 });
+  await page.click(passwordSelector);
+  await page.keyboard.type(password, { delay: 50 });
+  await page.keyboard.press('Enter');
+  await page.waitForNavigation({ waitUntil: 'networkidle2' });
+  return { success: true, message: 'Logged in successfully', currentUrl: page.url() };
 }
 
 // ============ TRADING DATA FUNCTIONS ============
@@ -976,6 +1080,84 @@ const tools = [
     }
   },
   {
+    name: 'browser_navigate',
+    description: 'Navigate browser to a URL.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'URL to navigate to' },
+        wait_for_selector: { type: 'string', description: 'CSS selector to wait for' }
+      },
+      required: ['url']
+    }
+  },
+  {
+    name: 'browser_login',
+    description: 'Auto-detect and fill login form.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string' },
+        username: { type: 'string' },
+        password: { type: 'string' }
+      },
+      required: ['url', 'username', 'password']
+    }
+  },
+  {
+    name: 'browser_click',
+    description: 'Click an element on the page.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS selector' },
+        wait_for_navigation: { type: 'boolean' }
+      },
+      required: ['selector']
+    }
+  },
+  {
+    name: 'browser_type',
+    description: 'Type text into an input field.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string' },
+        text: { type: 'string' },
+        press_enter: { type: 'boolean' }
+      },
+      required: ['selector', 'text']
+    }
+  },
+  {
+    name: 'browser_extract_text',
+    description: 'Extract text from page or element.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS selector (optional - extracts full page if empty)' }
+      }
+    }
+  },
+  {
+    name: 'browser_screenshot',
+    description: 'Take a screenshot and send to Rod via Telegram.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        filename: { type: 'string' }
+      }
+    }
+  },
+  {
+    name: 'browser_close',
+    description: 'Close browser session.',
+    input_schema: {
+      type: 'object',
+      properties: {}
+    }
+  },
+  {
     name: 'alpaca_place_order',
     description: 'Place a trade order via Alpaca. Supports market, limit, stop, and stop_limit orders. Default is paper trading.',
     input_schema: {
@@ -1097,6 +1279,20 @@ async function processTool(name, input, userId) {
   if (name === 'github_create_file') return await githubCreateOrUpdateFile(input.path, input.content, input.commit_message);
   if (name === 'github_read_file') return await githubReadFile(input.path);
   if (name === 'github_list_files') return await githubListFiles(input.path || '');
+
+  // Browser automation
+  if (name === 'browser_navigate') return await browserNavigate(input.url, input.wait_for_selector);
+  if (name === 'browser_login') return await browserLogin(input.url, input.username, input.password);
+  if (name === 'browser_click') return await browserClick(input.selector, input.wait_for_navigation || false);
+  if (name === 'browser_type') return await browserType(input.selector, input.text, input.press_enter || false);
+  if (name === 'browser_extract_text') return await browserExtractText(input.selector);
+  if (name === 'browser_screenshot') {
+    const result = await browserScreenshot(userId, input.filename);
+    await bot.telegram.sendPhoto(userId, { source: result.path });
+    await fs.unlink(result.path).catch(() => {});
+    return result;
+  }
+  if (name === 'browser_close') return await browserClose();
 
   // Alpaca trading
   if (name === 'alpaca_place_order') {
