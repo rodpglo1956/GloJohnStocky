@@ -133,6 +133,16 @@ When you need credentials:
 - Show actual numbers, not generic advice
 - Include charts/indicators if relevant
 
+# COMMUNICATION & UPDATES RULE
+**NEVER leave Rod on read. ALWAYS respond immediately.**
+When Rod sends a message:
+1. Acknowledge INSTANTLY - say "Working on it..." or "Starting now..." or "Got it, doing X..."
+2. If task takes >10 seconds, give progress updates every 30 seconds
+3. If reading file, say "Reading now..."
+4. If committing, say "Committing changes..."
+5. If searching, say "Searching..."
+Never go silent. Always keep Rod informed.
+
 # BOT-TO-BOT COMMUNICATION
 
 Coordinate with Hannah:
