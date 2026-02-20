@@ -3,6 +3,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
 const { Octokit } = require('@octokit/rest');
 const axios = require('axios');
+const Alpaca = require('@alpacahq/alpaca-trade-api');
 
 // Init clients
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
@@ -625,6 +626,166 @@ async function getStrategies() {
   return data || [];
 }
 
+// ============ ALPACA TRADING ============
+
+function getAlpacaClient() {
+  const keyId = process.env.ALPACA_API_KEY_ID;
+  const secretKey = process.env.ALPACA_API_SECRET_KEY;
+  const paper = process.env.ALPACA_PAPER !== 'false'; // default to paper trading
+  if (!keyId || !secretKey) return null;
+  return new Alpaca({ keyId, secretKey, paper, feed: 'iex' });
+}
+
+async function alpacaPlaceOrder(symbol, qty, side, type = 'market', limitPrice = null, stopPrice = null, timeInForce = 'day') {
+  const alpaca = getAlpacaClient();
+  if (!alpaca) return { error: 'Alpaca not configured. Set ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY env vars or use /setcred.' };
+
+  const orderParams = { symbol: symbol.toUpperCase(), qty, side, type, time_in_force: timeInForce };
+  if (type === 'limit' && limitPrice) orderParams.limit_price = limitPrice;
+  if (type === 'stop' && stopPrice) orderParams.stop_price = stopPrice;
+  if (type === 'stop_limit') { orderParams.limit_price = limitPrice; orderParams.stop_price = stopPrice; }
+
+  try {
+    const order = await alpaca.createOrder(orderParams);
+    // Log the trade to DB
+    await saveTrade(symbol, side, qty, limitPrice || order.filled_avg_price || 0, order.status, 'alpaca', `Order ID: ${order.id}`);
+    return {
+      success: true, order_id: order.id, symbol: order.symbol, side: order.side,
+      qty: order.qty, type: order.type, status: order.status, submitted_at: order.submitted_at
+    };
+  } catch (error) {
+    return { error: `Order failed: ${error.message}` };
+  }
+}
+
+async function alpacaGetPositions() {
+  const alpaca = getAlpacaClient();
+  if (!alpaca) return { error: 'Alpaca not configured.' };
+  try {
+    const positions = await alpaca.getPositions();
+    return positions.map(p => ({
+      symbol: p.symbol, qty: parseFloat(p.qty), side: p.side,
+      avg_entry: parseFloat(p.avg_entry_price), current_price: parseFloat(p.current_price),
+      market_value: parseFloat(p.market_value), unrealized_pl: parseFloat(p.unrealized_pl),
+      unrealized_plpc: parseFloat(p.unrealized_plpc), change_today: parseFloat(p.change_today)
+    }));
+  } catch (error) {
+    return { error: `Failed to get positions: ${error.message}` };
+  }
+}
+
+async function alpacaGetAccount() {
+  const alpaca = getAlpacaClient();
+  if (!alpaca) return { error: 'Alpaca not configured.' };
+  try {
+    const account = await alpaca.getAccount();
+    return {
+      buying_power: parseFloat(account.buying_power), cash: parseFloat(account.cash),
+      portfolio_value: parseFloat(account.portfolio_value), equity: parseFloat(account.equity),
+      long_market_value: parseFloat(account.long_market_value),
+      short_market_value: parseFloat(account.short_market_value),
+      daytrade_count: account.daytrade_count, pattern_day_trader: account.pattern_day_trader,
+      status: account.status, currency: account.currency
+    };
+  } catch (error) {
+    return { error: `Failed to get account: ${error.message}` };
+  }
+}
+
+async function alpacaGetOrders(status = 'open', limit = 20) {
+  const alpaca = getAlpacaClient();
+  if (!alpaca) return { error: 'Alpaca not configured.' };
+  try {
+    const orders = await alpaca.getOrders({ status, limit, direction: 'desc' });
+    return orders.map(o => ({
+      id: o.id, symbol: o.symbol, side: o.side, qty: o.qty, type: o.type,
+      status: o.status, filled_qty: o.filled_qty, filled_avg_price: o.filled_avg_price,
+      limit_price: o.limit_price, stop_price: o.stop_price, submitted_at: o.submitted_at
+    }));
+  } catch (error) {
+    return { error: `Failed to get orders: ${error.message}` };
+  }
+}
+
+async function alpacaCancelOrder(orderId) {
+  const alpaca = getAlpacaClient();
+  if (!alpaca) return { error: 'Alpaca not configured.' };
+  try {
+    await alpaca.cancelOrder(orderId);
+    return { success: true, message: `Order ${orderId} cancelled` };
+  } catch (error) {
+    return { error: `Cancel failed: ${error.message}` };
+  }
+}
+
+// ============ OPENROUTER INTEGRATION ============
+
+async function getOpenRouterKey() {
+  const creds = await getMemory('credential_openrouter');
+  if (creds && creds.length > 0) return creds[0].value.value;
+  if (process.env.OPENROUTER_API_KEY) return process.env.OPENROUTER_API_KEY;
+  return null;
+}
+
+async function openRouterGenerateImage(prompt, model = 'openai/dall-e-3', size = '1024x1024') {
+  const apiKey = await getOpenRouterKey();
+  if (!apiKey) return { error: 'Need OpenRouter API key. Use: /setcred OPENROUTER your_key' };
+
+  try {
+    const response = await axios.post('https://openrouter.ai/api/v1/images/generations', {
+      model, prompt, n: 1, size
+    }, {
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' }
+    });
+    const imageUrl = response.data.data?.[0]?.url || response.data.data?.[0]?.b64_json;
+    return { success: true, url: imageUrl, prompt, model };
+  } catch (error) {
+    return { error: `Image generation failed: ${error.response?.data?.error?.message || error.message}` };
+  }
+}
+
+async function openRouterChatWithModel(messages, model = 'openai/gpt-4o', temperature = 0.7) {
+  const apiKey = await getOpenRouterKey();
+  if (!apiKey) return { error: 'Need OpenRouter API key. Use: /setcred OPENROUTER your_key' };
+
+  try {
+    const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
+      model, messages, temperature
+    }, {
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' }
+    });
+    const reply = response.data.choices?.[0]?.message?.content || '';
+    return { success: true, reply, model, usage: response.data.usage };
+  } catch (error) {
+    return { error: `Chat failed: ${error.response?.data?.error?.message || error.message}` };
+  }
+}
+
+async function openRouterTranscribeAudio(audioUrl) {
+  const apiKey = await getOpenRouterKey();
+  if (!apiKey) return { error: 'Need OpenRouter API key. Use: /setcred OPENROUTER your_key' };
+
+  try {
+    // Download the audio file first
+    const audioResponse = await axios.get(audioUrl, { responseType: 'arraybuffer' });
+    const base64Audio = Buffer.from(audioResponse.data).toString('base64');
+
+    const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
+      model: 'openai/whisper-1',
+      messages: [{ role: 'user', content: [
+        { type: 'text', text: 'Transcribe this audio.' },
+        { type: 'input_audio', input_audio: { data: base64Audio, format: 'mp3' } }
+      ]}]
+    }, {
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' }
+    });
+    const text = response.data.choices?.[0]?.message?.content || '';
+    return { success: true, text };
+  } catch (error) {
+    return { error: `Transcription failed: ${error.response?.data?.error?.message || error.message}` };
+  }
+}
+
 // Tool definitions
 const tools = [
   {
@@ -813,6 +974,93 @@ const tools = [
         path: { type: 'string' }
       }
     }
+  },
+  {
+    name: 'alpaca_place_order',
+    description: 'Place a trade order via Alpaca. Supports market, limit, stop, and stop_limit orders. Default is paper trading.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        symbol: { type: 'string', description: 'Stock ticker (e.g., AAPL, TSLA)' },
+        qty: { type: 'number', description: 'Number of shares' },
+        side: { type: 'string', enum: ['buy', 'sell'], description: 'Buy or sell' },
+        type: { type: 'string', enum: ['market', 'limit', 'stop', 'stop_limit'], description: 'Order type (default: market)' },
+        limit_price: { type: 'number', description: 'Limit price (for limit/stop_limit orders)' },
+        stop_price: { type: 'number', description: 'Stop price (for stop/stop_limit orders)' },
+        time_in_force: { type: 'string', enum: ['day', 'gtc', 'ioc', 'fok'], description: 'Time in force (default: day)' }
+      },
+      required: ['symbol', 'qty', 'side']
+    }
+  },
+  {
+    name: 'alpaca_get_positions',
+    description: 'Get all current open positions from Alpaca. Shows symbol, qty, avg entry price, current price, unrealized P&L.',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'alpaca_get_account',
+    description: 'Get Alpaca account info: buying power, cash, portfolio value, equity, day trade count.',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'alpaca_get_orders',
+    description: 'Get orders from Alpaca. Can filter by status (open, closed, all).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', enum: ['open', 'closed', 'all'], description: 'Order status filter (default: open)' },
+        limit: { type: 'number', description: 'Max orders to return (default: 20)' }
+      }
+    }
+  },
+  {
+    name: 'alpaca_cancel_order',
+    description: 'Cancel an open order by order ID.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        order_id: { type: 'string', description: 'The Alpaca order ID to cancel' }
+      },
+      required: ['order_id']
+    }
+  },
+  {
+    name: 'generate_image',
+    description: 'Generate an image using DALL-E or Stable Diffusion via OpenRouter. Requires OPENROUTER API key (/setcred OPENROUTER your_key).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'Image generation prompt' },
+        model: { type: 'string', description: 'Model to use (default: openai/dall-e-3). Options: openai/dall-e-3, stabilityai/stable-diffusion-xl' },
+        size: { type: 'string', description: 'Image size (default: 1024x1024)' }
+      },
+      required: ['prompt']
+    }
+  },
+  {
+    name: 'chat_with_model',
+    description: 'Chat with any AI model via OpenRouter. Rod can specify which model (GPT-4o, Gemini, Llama, Mistral, etc). Requires OPENROUTER API key.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'The message to send to the model' },
+        model: { type: 'string', description: 'Model to use (default: openai/gpt-4o). Examples: google/gemini-pro, meta-llama/llama-3-70b, mistralai/mixtral-8x7b' },
+        system_prompt: { type: 'string', description: 'Optional system prompt for the model' },
+        temperature: { type: 'number', description: 'Temperature 0-2 (default: 0.7)' }
+      },
+      required: ['prompt']
+    }
+  },
+  {
+    name: 'transcribe_audio',
+    description: 'Transcribe audio to text using Whisper via OpenRouter. Provide a URL to an audio file. Requires OPENROUTER API key.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        audio_url: { type: 'string', description: 'URL of the audio file to transcribe' }
+      },
+      required: ['audio_url']
+    }
   }
 ];
 
@@ -849,7 +1097,36 @@ async function processTool(name, input, userId) {
   if (name === 'github_create_file') return await githubCreateOrUpdateFile(input.path, input.content, input.commit_message);
   if (name === 'github_read_file') return await githubReadFile(input.path);
   if (name === 'github_list_files') return await githubListFiles(input.path || '');
-  
+
+  // Alpaca trading
+  if (name === 'alpaca_place_order') {
+    return await alpacaPlaceOrder(input.symbol, input.qty, input.side, input.type || 'market', input.limit_price, input.stop_price, input.time_in_force || 'day');
+  }
+  if (name === 'alpaca_get_positions') return await alpacaGetPositions();
+  if (name === 'alpaca_get_account') return await alpacaGetAccount();
+  if (name === 'alpaca_get_orders') return await alpacaGetOrders(input.status || 'open', input.limit || 20);
+  if (name === 'alpaca_cancel_order') return await alpacaCancelOrder(input.order_id);
+
+  // OpenRouter
+  if (name === 'generate_image') {
+    const result = await openRouterGenerateImage(input.prompt, input.model, input.size);
+    if (result.url && !result.error) {
+      try {
+        await bot.telegram.sendPhoto(userId, result.url, { caption: `🎨 ${input.prompt}` });
+      } catch (e) {
+        // If URL doesn't work as photo, send as text
+      }
+    }
+    return result;
+  }
+  if (name === 'chat_with_model') {
+    const messages = [];
+    if (input.system_prompt) messages.push({ role: 'system', content: input.system_prompt });
+    messages.push({ role: 'user', content: input.prompt });
+    return await openRouterChatWithModel(messages, input.model || 'openai/gpt-4o', input.temperature || 0.7);
+  }
+  if (name === 'transcribe_audio') return await openRouterTranscribeAudio(input.audio_url);
+
   throw new Error(`Unknown tool: ${name}`);
 }
 
@@ -963,8 +1240,12 @@ async function executeTask(task) {
 
     if (task.task_type === 'trade') {
       const data = task.task_data;
-      // Execute trade logic here
-      message = `🚀 Executed scheduled trade: ${data.side.toUpperCase()} ${data.qty} ${data.symbol}`;
+      const result = await alpacaPlaceOrder(data.symbol, data.qty, data.side, data.type || 'market', data.limit_price, data.stop_price);
+      if (result.error) {
+        message = `❌ Scheduled trade FAILED: ${data.side.toUpperCase()} ${data.qty} ${data.symbol} — ${result.error}`;
+      } else {
+        message = `🚀 Executed scheduled trade: ${data.side.toUpperCase()} ${data.qty} ${data.symbol} | Order ID: ${result.order_id} | Status: ${result.status}`;
+      }
     } else if (task.task_type === 'alert') {
       message = `🚨 ${task.description}`;
     } else if (task.task_type === 'report') {
