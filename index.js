@@ -1,5 +1,4 @@
 const { Telegraf } = require('telegraf');
-const Anthropic = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
 const { Octokit } = require('@octokit/rest');
 const axios = require('axios');
@@ -9,7 +8,6 @@ const fs = require('fs').promises;
 
 // Init clients
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const github = new Octokit({ auth: process.env.GITHUB_TOKEN });
 
@@ -962,6 +960,25 @@ async function openRouterChatWithModel(messages, model = 'openai/gpt-4o', temper
   }
 }
 
+async function openRouterMessages({ model, max_tokens, system, tools, messages }) {
+  const apiKey = await getOpenRouterKey();
+  if (!apiKey) throw new Error('No OpenRouter API key. Use: /setcred OPENROUTER your_key');
+
+  const body = { model: `anthropic/${model}`, max_tokens, system, messages };
+  if (tools && tools.length > 0) body.tools = tools;
+
+  const response = await axios.post('https://openrouter.ai/api/v1/messages', body, {
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'HTTP-Referer': 'https://github.com/rodpglo1956/GloJohnStocky',
+      'X-Title': 'GloJohnStocky'
+    }
+  });
+
+  return response.data;
+}
+
 async function openRouterTranscribeAudio(audioUrl) {
   const apiKey = await getOpenRouterKey();
   if (!apiKey) return { error: 'Need OpenRouter API key. Use: /setcred OPENROUTER your_key' };
@@ -1511,7 +1528,7 @@ async function runJohn(userId, userMessage) {
   
   while (retries > 0) {
     try {
-      response = await anthropic.messages.create({
+      response = await openRouterMessages({
         model: currentModel,
         max_tokens: 4096,
         system: systemPrompt,
@@ -1520,7 +1537,7 @@ async function runJohn(userId, userMessage) {
       });
       break;
     } catch (err) {
-      if (err.status === 429 && retries > 1) {
+      if ((err.status === 429 || err.response?.status === 429) && retries > 1) {
         await new Promise(resolve => setTimeout(resolve, 15000));
         retries--;
       } else throw err;
@@ -1544,11 +1561,11 @@ async function runJohn(userId, userMessage) {
     }
     messages.push({ role: 'assistant', content: response.content });
     messages.push({ role: 'user', content: toolResults });
-    
+
     retries = 3;
     while (retries > 0) {
       try {
-        response = await anthropic.messages.create({
+        response = await openRouterMessages({
           model: currentModel,
           max_tokens: 4096,
           system: systemPrompt,
@@ -1557,7 +1574,7 @@ async function runJohn(userId, userMessage) {
         });
         break;
       } catch (err) {
-        if (err.status === 429 && retries > 1) {
+        if ((err.status === 429 || err.response?.status === 429) && retries > 1) {
           await new Promise(resolve => setTimeout(resolve, 15000));
           retries--;
         } else throw err;
@@ -1922,7 +1939,7 @@ bot.on('photo', async (ctx) => {
       ]
     });
 
-    const aiResponse = await anthropic.messages.create({
+    const aiResponse = await openRouterMessages({
       model: currentModel,
       max_tokens: 4096,
       system: getSystemPrompt(),
