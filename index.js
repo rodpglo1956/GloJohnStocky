@@ -30,16 +30,25 @@ Market Status: ${isMarketHours(now) ? 'OPEN 🟢' : 'CLOSED 🔴'}
 
 When Rod says "today," "tomorrow," or time references, calculate relative to the current date/time above.
 
-# IDENTITY AND CONTEXT
-You are John Stocky. Your name is JOHN STOCKY. Not "John," not "Stocky," not anything else - JOHN STOCKY.
-You respond in first person: "I'll analyze that trade" or "I'm John Stocky, your trading assistant."
-Hannah is a SEPARATE bot that Rod also talks to. You are NOT Hannah.
-Hannah does research and sends you findings. You do analysis and execute trades.
+# IDENTITY RULES - ABSOLUTELY CRITICAL
 
-Never say "Hannah should be able to..." — If Rod asks you to do something, YOU do it.
-Never refer to yourself in third person. You're John Stocky speaking directly to Rod.
+YOU ARE JOHN STOCKY. Your name is JOHN STOCKY.
 
-If Rod asks "who are you" or "what's your name," always say: "I'm John Stocky, your elite trading assistant."
+**ALWAYS use first person:**
+✅ "I'm John Stocky"
+✅ "I'll analyze that trade"
+✅ "I sent the message to Hannah"
+
+**NEVER use third person about yourself:**
+❌ "John should do that"
+❌ "He will analyze"
+❌ "John Stocky is working on it"
+
+**When asked who you are:** "I'm John Stocky, your elite trading assistant"
+
+Hannah is a SEPARATE bot. You are NOT Hannah. If Rod asks you to do something, YOU do it.
+
+If you catch yourself using third person, STOP and rewrite in first person.
 
 # YOUR CORE CAPABILITIES
 
@@ -320,9 +329,9 @@ async function getMemory(key) {
 // ============ BOT COMMUNICATION ============
 
 async function sendToHannah(message, context = {}) {
-  const { error } = await supabase
-    .from('bot_messages')
-    .insert({
+  try {
+    console.log(`📤 John → Hannah: ${message.substring(0, 50)}...`);
+    const { error } = await supabase.from('bot_messages').insert({
       from_bot: 'John',
       to_bot: 'Hannah',
       message,
@@ -330,27 +339,36 @@ async function sendToHannah(message, context = {}) {
       read: false,
       created_at: new Date().toISOString()
     });
-  if (error) throw error;
+    if (error) {
+      console.error('❌ Failed:', error);
+      throw error;
+    }
+    console.log('✅ Sent successfully');
+    return { success: true };
+  } catch (err) {
+    console.error('❌ Error:', err);
+    throw new Error(`Could not send to Hannah: ${err.message}`);
+  }
 }
 
 async function checkHannahMessages() {
-  const { data, error } = await supabase
-    .from('bot_messages')
-    .select('*')
-    .eq('to_bot', 'John')
-    .eq('from_bot', 'Hannah')
-    .eq('read', false)
-    .order('created_at', { ascending: true });
-  if (error) throw error;
-  
-  if (data && data.length > 0) {
-    await supabase
-      .from('bot_messages')
-      .update({ read: true })
-      .in('id', data.map(m => m.id));
+  try {
+    console.log('📬 Checking for messages from Hannah...');
+    const { data, error } = await supabase.from('bot_messages').select('*')
+      .eq('to_bot', 'John').eq('from_bot', 'Hannah').eq('read', false)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    if (data && data.length > 0) {
+      console.log(`✅ Found ${data.length} message(s)`);
+      await supabase.from('bot_messages').update({ read: true }).in('id', data.map(m => m.id));
+      return data;
+    }
+    console.log('📭 No messages');
+    return [];
+  } catch (err) {
+    console.error('❌ Error:', err);
+    return [];
   }
-  
-  return data || [];
 }
 
 // ============ GITHUB ============
@@ -836,14 +854,25 @@ async function runJohn(userId, userMessage) {
     overdueWarning = `\n\nCRITICAL: ${overdueTasks.length} overdue task(s):\n${overdueTasks.map(t => `- ${t.description} (due: ${t.scheduled_for})`).join('\n')}`;
   }
   
-  // Check Hannah messages
+  // CHECK HANNAH'S MESSAGES - AUTO-NOTIFY ROD
   const hannahMessages = await checkHannahMessages();
-  let hannahWarning = '';
+  let hannahAlert = '';
+  
   if (hannahMessages.length > 0) {
-    hannahWarning = `\n\nNEW FROM HANNAH:\n${hannahMessages.map(m => `[${new Date(m.created_at).toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: 'numeric', minute: '2-digit' })}] ${m.message}`).join('\n')}`;
+    const messageList = hannahMessages.map(m => {
+      const time = new Date(m.created_at).toLocaleTimeString('en-US', { 
+        timeZone: 'America/New_York', hour: 'numeric', minute: '2-digit'
+      });
+      return `[${time}] ${m.message}`;
+    }).join('\n\n');
+    
+    hannahAlert = `\n\n📬 NEW FROM HANNAH:\n${messageList}\n\nAcknowledge and use this data.`;
+    
+    // Send Telegram notification to Rod
+    await bot.telegram.sendMessage(userId, `📬 Message from Hannah:\n\n${hannahMessages[0].message.substring(0, 400)}`).catch(err => console.error('Notification failed:', err));
   }
   
-  const systemPrompt = getSystemPrompt() + overdueWarning + hannahWarning;
+  const systemPrompt = getSystemPrompt() + overdueWarning + hannahAlert;
 
   const messages = [
     ...history.map(h => ({ role: h.role, content: h.content })),
