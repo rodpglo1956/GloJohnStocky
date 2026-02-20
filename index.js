@@ -730,6 +730,48 @@ async function getStrategies() {
   return data || [];
 }
 
+// ============ SUPABASE QUERY TOOL ============
+
+async function supabaseQuery(table, operation, data = {}) {
+  try {
+    if (operation === 'select') {
+      let query = supabase.from(table).select(data.columns || '*');
+      if (data.filters) { for (const [col, val] of Object.entries(data.filters)) { query = query.eq(col, val); } }
+      if (data.ilike) { for (const [col, val] of Object.entries(data.ilike)) { query = query.ilike(col, `%${val}%`); } }
+      if (data.order) query = query.order(data.order.column, { ascending: data.order.ascending ?? false });
+      if (data.limit) query = query.limit(data.limit);
+      const { data: rows, error } = await query;
+      if (error) throw error;
+      return { success: true, count: rows.length, data: rows };
+    }
+    if (operation === 'insert') {
+      const { data: rows, error } = await supabase.from(table).insert(data.rows || data.row).select();
+      if (error) throw error;
+      return { success: true, inserted: rows?.length || 1, data: rows };
+    }
+    if (operation === 'update') {
+      let query = supabase.from(table).update(data.values);
+      if (data.filters) { for (const [col, val] of Object.entries(data.filters)) { query = query.eq(col, val); } }
+      const { data: rows, error } = await query.select();
+      if (error) throw error;
+      return { success: true, updated: rows?.length || 0, data: rows };
+    }
+    if (operation === 'delete') {
+      let query = supabase.from(table).delete();
+      if (data.filters) { for (const [col, val] of Object.entries(data.filters)) { query = query.eq(col, val); } }
+      const { data: rows, error } = await query.select();
+      if (error) throw error;
+      return { success: true, deleted: rows?.length || 0 };
+    }
+    if (operation === 'rpc') {
+      const { data: result, error } = await supabase.rpc(data.function_name, data.params || {});
+      if (error) throw error;
+      return { success: true, data: result };
+    }
+    return { error: `Unknown operation: ${operation}. Use: select, insert, update, delete, rpc` };
+  } catch (error) { return { error: `Supabase ${operation} failed: ${error.message}` }; }
+}
+
 // ============ ALPACA TRADING ============
 
 function getAlpacaClient() {
@@ -1243,6 +1285,22 @@ const tools = [
       },
       required: ['audio_url']
     }
+  },
+  {
+    name: 'supabase_query',
+    description: 'Run any Supabase database query. Supports select, insert, update, delete, and rpc operations on any table.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string', description: 'Table name' },
+        operation: { type: 'string', enum: ['select', 'insert', 'update', 'delete', 'rpc'], description: 'Operation type' },
+        data: {
+          type: 'object',
+          description: 'For select: {columns, filters: {col: val}, ilike: {col: val}, order: {column, ascending}, limit}. For insert: {row: {...}} or {rows: [...]}. For update: {values: {...}, filters: {col: val}}. For delete: {filters: {col: val}}. For rpc: {function_name, params}.'
+        }
+      },
+      required: ['table', 'operation']
+    }
   }
 ];
 
@@ -1322,6 +1380,9 @@ async function processTool(name, input, userId) {
     return await openRouterChatWithModel(messages, input.model || 'openai/gpt-4o', input.temperature || 0.7);
   }
   if (name === 'transcribe_audio') return await openRouterTranscribeAudio(input.audio_url);
+
+  // Supabase
+  if (name === 'supabase_query') return await supabaseQuery(input.table, input.operation, input.data || {});
 
   throw new Error(`Unknown tool: ${name}`);
 }
