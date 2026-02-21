@@ -1790,7 +1790,7 @@ async function runJohn(userId, userMessage) {
 
   // Tool use loop with 400-error recovery
   let toolLoopCount = 0;
-  const maxToolLoops = 15;
+  const maxToolLoops = 8;
   while (response.stop_reason === 'tool_use' && toolLoopCount < maxToolLoops) {
     toolLoopCount++;
     const toolResults = [];
@@ -1843,9 +1843,31 @@ async function runJohn(userId, userMessage) {
     .join('\n')
     .trim();
 
-  // If no text found, check if loop hit maxToolLoops while model still wanted tools
+  // If model still wants tools but we hit the limit, force a text summary
   if (!finalText && response.stop_reason === 'tool_use') {
-    finalText = "I'm still working on that but hit my tool step limit. Let me try to summarize what I found so far — please ask again and I'll pick up where I left off.";
+    console.log(`Hit tool loop limit (${maxToolLoops}). Forcing summary response...`);
+    try {
+      const summaryMessages = [
+        { role: 'user', content: userMessage },
+        { role: 'assistant', content: sanitizeContentBlocks(response.content) },
+        { role: 'user', content: 'You have used all available tool steps. Please summarize what you have done so far and what you found. Give a clear, helpful response based on the work completed. Do NOT call any more tools.' }
+      ];
+      const summaryResponse = await callWithRetry(() =>
+        openRouterMessages({ model: currentModel, max_tokens: 4096, system: systemPrompt, messages: summaryMessages })
+          .then(validateResponse)
+      );
+      finalText = (summaryResponse.content || [])
+        .filter(b => b.type === 'text')
+        .map(b => (b.text != null ? String(b.text) : ''))
+        .join('\n')
+        .trim();
+      if (finalText) console.log('Forced summary successful');
+    } catch (summaryErr) {
+      console.log(`Forced summary failed: ${summaryErr.message}`);
+    }
+    if (!finalText) {
+      finalText = "I ran through all my tool steps but couldn't finish. Try asking again.";
+    }
   }
 
   if (!finalText) {
