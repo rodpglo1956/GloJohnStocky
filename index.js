@@ -1751,7 +1751,50 @@ async function runJohn(userId, userMessage) {
     }
   }
 
-  const finalText = (response.content || []).find(b => b.type === 'text')?.text || "Something went wrong!";
+  // Extract text from ALL text blocks, not just the first one
+  const contentBlocks = response.content || [];
+  let finalText = contentBlocks
+    .filter(b => b.type === 'text')
+    .map(b => (b.text != null ? String(b.text) : ''))
+    .join('\n')
+    .trim();
+
+  // If no text found, check if loop hit maxToolLoops while model still wanted tools
+  if (!finalText && response.stop_reason === 'tool_use') {
+    finalText = "I'm still working on that but hit my tool step limit. Let me try to summarize what I found so far — please ask again and I'll pick up where I left off.";
+  }
+
+  if (!finalText) {
+    // If there's a text block with empty text after tool work, ask model to summarize
+    const textBlocks = contentBlocks.filter(b => b.type === 'text');
+    if (textBlocks.length > 0 && toolLoopCount > 0) {
+      console.log('Empty text after tool work — attempting recovery...');
+      try {
+        const recoveryMessages = [
+          { role: 'user', content: userMessage },
+          { role: 'assistant', content: sanitizeContentBlocks(contentBlocks) },
+          { role: 'user', content: 'Please provide a text summary of what you found and any results from the tools you used.' }
+        ];
+        const recoveryResponse = await callWithRetry(() =>
+          openRouterMessages({ model: currentModel, max_tokens: 4096, system: systemPrompt, messages: recoveryMessages })
+            .then(validateResponse)
+        );
+        finalText = (recoveryResponse.content || [])
+          .filter(b => b.type === 'text')
+          .map(b => (b.text != null ? String(b.text) : ''))
+          .join('\n')
+          .trim();
+        if (finalText) console.log('Recovery successful — got text response');
+      } catch (recoveryErr) {
+        console.log(`Recovery failed: ${recoveryErr.message}`);
+      }
+    }
+
+    if (!finalText) {
+      finalText = "Something went wrong — I completed the tool steps but couldn't generate a response. Try again or rephrase your request.";
+    }
+  }
+
   await saveMessage(userId, 'user', userMessage);
   await saveMessage(userId, 'assistant', finalText);
   return finalText;
