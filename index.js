@@ -967,16 +967,58 @@ async function openRouterMessages({ model, max_tokens, system, tools, messages }
   const body = { model: `anthropic/${model}`, max_tokens, system, messages };
   if (tools && tools.length > 0) body.tools = tools;
 
-  const response = await axios.post('https://openrouter.ai/api/v1/messages', body, {
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': 'https://github.com/rodpglo1956/GloJohnStocky',
-      'X-Title': 'GloJohnStocky'
+  try {
+    const response = await axios.post('https://openrouter.ai/api/v1/messages', body, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://github.com/rodpglo1956/GloJohnStocky',
+        'X-Title': 'GloJohnStocky'
+      },
+      timeout: 60000
+    });
+    return response.data;
+  } catch (err) {
+    // Normalize axios errors so retry logic can check err.status
+    if (err.response) {
+      const error = new Error(err.response.data?.error?.message || `OpenRouter error ${err.response.status}`);
+      error.status = err.response.status;
+      throw error;
     }
-  });
+    if (err.code === 'ECONNABORTED') {
+      const error = new Error('Request timed out');
+      error.name = 'AbortError';
+      throw error;
+    }
+    throw err;
+  }
+}
 
-  return response.data;
+// Retry wrapper with exponential backoff for transient errors
+async function callWithRetry(fn, maxRetries = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      const status = err.status || err.response?.status || 0;
+      const retryable = [429, 500, 502, 503, 529].includes(status)
+        || err.name === 'AbortError'
+        || err.code === 'ECONNRESET'
+        || err.code === 'ETIMEDOUT'
+        || err.code === 'ECONNABORTED';
+
+      if (retryable && attempt < maxRetries) {
+        const delay = Math.min(5000 * Math.pow(2, attempt - 1), 30000);
+        console.log(`Retry ${attempt}/${maxRetries} after ${delay/1000}s — ${err.message}`);
+        await new Promise(r => setTimeout(r, delay));
+      } else {
+        throw err;
+      }
+    }
+  }
+  throw lastError;
 }
 
 async function openRouterTranscribeAudio(audioUrl) {
@@ -1522,28 +1564,16 @@ async function runJohn(userId, userMessage) {
     { role: 'user', content: userMessage }
   ];
 
-  // Rate limit retry
-  let retries = 3;
-  let response;
-  
-  while (retries > 0) {
-    try {
-      response = await openRouterMessages({
-        model: currentModel,
-        max_tokens: 4096,
-        system: systemPrompt,
-        tools,
-        messages
-      });
-      break;
-    } catch (err) {
-      if ((err.status === 429 || err.response?.status === 429) && retries > 1) {
-        await new Promise(resolve => setTimeout(resolve, 15000));
-        retries--;
-      } else throw err;
-    }
-  }
+  // Initial API call with retry
+  let response = await callWithRetry(() => openRouterMessages({
+    model: currentModel,
+    max_tokens: 4096,
+    system: systemPrompt,
+    tools,
+    messages
+  }));
 
+  // Tool use loop
   while (response.stop_reason === 'tool_use') {
     const toolResults = [];
     for (const block of response.content.filter(b => b.type === 'tool_use')) {
@@ -1562,24 +1592,13 @@ async function runJohn(userId, userMessage) {
     messages.push({ role: 'assistant', content: response.content });
     messages.push({ role: 'user', content: toolResults });
 
-    retries = 3;
-    while (retries > 0) {
-      try {
-        response = await openRouterMessages({
-          model: currentModel,
-          max_tokens: 4096,
-          system: systemPrompt,
-          tools,
-          messages
-        });
-        break;
-      } catch (err) {
-        if ((err.status === 429 || err.response?.status === 429) && retries > 1) {
-          await new Promise(resolve => setTimeout(resolve, 15000));
-          retries--;
-        } else throw err;
-      }
-    }
+    response = await callWithRetry(() => openRouterMessages({
+      model: currentModel,
+      max_tokens: 4096,
+      system: systemPrompt,
+      tools,
+      messages
+    }));
   }
 
   const finalText = response.content.find(b => b.type === 'text')?.text || "Something went wrong!";
@@ -1983,7 +2002,18 @@ bot.on('text', async (ctx) => {
     }
   } catch (err) {
     console.error('Error:', err);
-    ctx.reply("Having trouble. Try again!");
+    const status = err.status || 0;
+    if (status === 429) {
+      await ctx.reply("I'm getting rate-limited by the AI provider. Give me about 30 seconds and try again.");
+    } else if ([500, 502, 503, 529].includes(status)) {
+      await ctx.reply("The AI server is having issues right now. Try again in a minute.");
+    } else if (err.name === 'AbortError') {
+      await ctx.reply("That request timed out — the AI was too slow to respond. Try again?");
+    } else if (err.message?.includes('OpenRouter API key')) {
+      await ctx.reply("I don't have my API key set up. Rod needs to run: /setcred OPENROUTER your_key");
+    } else {
+      await ctx.reply("I hit an unexpected error. Try again, or check /status if this keeps happening.");
+    }
   }
 });
 
