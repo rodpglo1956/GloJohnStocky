@@ -473,17 +473,85 @@ async function githubListFiles(path = '') {
 // ============ BROWSER AUTOMATION ============
 
 async function ensureBrowser() {
+  // Health check: verify existing browser/page is still alive
+  if (browser && browserPage) {
+    try {
+      await browserPage.evaluate(() => true);
+      return browserPage;
+    } catch (e) {
+      console.log('Browser page unresponsive, recreating...');
+      try { await browser.close(); } catch (closeErr) {}
+      browser = null;
+      browserPage = null;
+    }
+  }
+
   if (!browser) {
-    browser = await puppeteer.launch({
+    const launchOptions = {
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
-    });
+    };
+    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+      launchOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+    }
+    browser = await puppeteer.launch(launchOptions);
   }
   if (!browserPage) {
     browserPage = await browser.newPage();
     await browserPage.setViewport({ width: 1920, height: 1080 });
   }
   return browserPage;
+}
+
+// Helper: find login form fields via DOM traversal (works on SPAs)
+async function findLoginFields(page, timeoutMs = 15000) {
+  const formReady = await page.evaluate((timeout) => {
+    return new Promise((resolve) => {
+      let elapsed = 0;
+      const check = () => {
+        const passInput = document.querySelector('input[type="password"]');
+        if (passInput) return resolve(true);
+        elapsed += 500;
+        if (elapsed >= timeout) return resolve(false);
+        setTimeout(check, 500);
+      };
+      check();
+    });
+  }, timeoutMs);
+  if (!formReady) return null;
+
+  return await page.evaluate(() => {
+    const inputs = Array.from(document.querySelectorAll('input'));
+    const visible = inputs.filter(el => {
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    });
+    let emailIdx = null, passIdx = null;
+    for (let i = 0; i < visible.length; i++) {
+      const inp = visible[i];
+      const attrs = {
+        type: (inp.type || '').toLowerCase(), name: (inp.name || '').toLowerCase(),
+        id: (inp.id || '').toLowerCase(), placeholder: (inp.placeholder || '').toLowerCase(),
+        autocomplete: (inp.autocomplete || '').toLowerCase(), ariaLabel: (inp.getAttribute('aria-label') || '').toLowerCase()
+      };
+      if (attrs.type === 'password' && passIdx === null) { passIdx = i; continue; }
+      if (emailIdx === null) {
+        const isEmail = attrs.type === 'email'
+          || ['email', 'username', 'userid', 'login'].some(k => attrs.name.includes(k) || attrs.id.includes(k))
+          || ['email', 'username'].some(k => attrs.placeholder.includes(k) || attrs.ariaLabel.includes(k))
+          || attrs.autocomplete === 'email' || attrs.autocomplete === 'username';
+        if (isEmail) emailIdx = i;
+      }
+    }
+    if (emailIdx === null && passIdx !== null) {
+      for (let i = passIdx - 1; i >= 0; i--) {
+        const t = (visible[i].type || '').toLowerCase();
+        if (t === 'text' || t === 'email' || t === '') { emailIdx = i; break; }
+      }
+    }
+    return { emailIdx, passIdx, totalVisible: visible.length };
+  });
 }
 
 async function browserNavigate(url, waitForSelector = null) {
@@ -552,19 +620,35 @@ async function browserClose() {
 async function browserLogin(url, username, password) {
   const page = await ensureBrowser();
   await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-  const usernameSelectors = ['input[name="username"]', 'input[name="email"]', 'input[type="email"]', 'input[id="username"]', 'input[id="email"]'];
-  const passwordSelectors = ['input[name="password"]', 'input[type="password"]', 'input[id="password"]'];
-  let usernameSelector, passwordSelector;
-  for (const sel of usernameSelectors) { try { await page.waitForSelector(sel, { timeout: 1000 }); usernameSelector = sel; break; } catch (e) { continue; } }
-  for (const sel of passwordSelectors) { try { await page.waitForSelector(sel, { timeout: 1000 }); passwordSelector = sel; break; } catch (e) { continue; } }
-  if (!usernameSelector || !passwordSelector) throw new Error('Could not find login form');
-  await page.waitForSelector(usernameSelector);
-  await page.click(usernameSelector);
+
+  // Use intelligent DOM traversal instead of hardcoded selectors
+  const fieldInfo = await findLoginFields(page, 15000);
+  if (!fieldInfo || fieldInfo.emailIdx === null || fieldInfo.passIdx === null) {
+    throw new Error(`Could not find login form on ${url} (found ${fieldInfo?.totalVisible || 0} visible inputs)`);
+  }
+
+  // Fill email field
+  await page.evaluate((idx) => {
+    const visible = Array.from(document.querySelectorAll('input')).filter(el => {
+      const rect = el.getBoundingClientRect(); const style = window.getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    });
+    visible[idx].focus(); visible[idx].click();
+  }, fieldInfo.emailIdx);
   await page.keyboard.type(username, { delay: 50 });
-  await page.click(passwordSelector);
+
+  // Fill password field
+  await page.evaluate((idx) => {
+    const visible = Array.from(document.querySelectorAll('input')).filter(el => {
+      const rect = el.getBoundingClientRect(); const style = window.getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    });
+    visible[idx].focus(); visible[idx].click();
+  }, fieldInfo.passIdx);
   await page.keyboard.type(password, { delay: 50 });
   await page.keyboard.press('Enter');
-  await page.waitForNavigation({ waitUntil: 'networkidle2' });
+
+  try { await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }); } catch (e) { /* SPA may not navigate */ }
   return { success: true, message: 'Logged in successfully', currentUrl: page.url() };
 }
 
@@ -1029,7 +1113,7 @@ async function openRouterMessages({ model, max_tokens, system, tools, messages }
         'HTTP-Referer': 'https://github.com/rodpglo1956/GloJohnStocky',
         'X-Title': 'GloJohnStocky'
       },
-      timeout: 60000
+      timeout: 45000
     });
     return response.data;
   } catch (err) {
@@ -2212,6 +2296,9 @@ bot.on('text', async (ctx) => {
   }
 });
 
-bot.launch().then(() => console.log('John Stocky Ultimate is running!'));
+bot.launch().then(async () => {
+  console.log('John Stocky Ultimate is running!');
+  ensureBrowser().then(() => console.log('Browser pre-warmed')).catch(e => console.log('Browser pre-warm failed:', e.message));
+});
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
