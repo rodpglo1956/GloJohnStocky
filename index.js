@@ -1031,6 +1031,36 @@ function validateResponse(response) {
   return response;
 }
 
+// Sanitize conversation history before sending to API
+// Fixes: null content, non-string content, consecutive same-role messages, leading assistant messages
+function sanitizeHistory(history) {
+  const sanitized = [];
+  for (const h of history) {
+    if (h.content == null) continue;
+
+    let content = h.content;
+    if (typeof content !== 'string') {
+      content = typeof content === 'object' ? JSON.stringify(content) : String(content);
+    }
+
+    if (!content.trim()) continue;
+
+    const role = h.role === 'assistant' ? 'assistant' : 'user';
+
+    if (sanitized.length > 0 && sanitized[sanitized.length - 1].role === role) {
+      sanitized[sanitized.length - 1].content += '\n\n' + content;
+    } else {
+      sanitized.push({ role, content });
+    }
+  }
+
+  while (sanitized.length > 0 && sanitized[0].role !== 'user') {
+    sanitized.shift();
+  }
+
+  return sanitized;
+}
+
 async function openRouterTranscribeAudio(audioUrl) {
   const apiKey = await getOpenRouterKey();
   if (!apiKey) return { error: 'Need OpenRouter API key. Use: /setcred OPENROUTER your_key' };
@@ -1570,15 +1600,33 @@ async function runJohn(userId, userMessage) {
   const systemPrompt = getSystemPrompt() + overdueWarning + hannahAlert;
 
   const messages = [
-    ...history.map(h => ({ role: h.role, content: h.content })),
+    ...sanitizeHistory(history),
     { role: 'user', content: userMessage }
   ];
 
   // Initial API call with retry + validation
-  let response = await callWithRetry(() =>
-    openRouterMessages({ model: currentModel, max_tokens: 4096, system: systemPrompt, tools, messages })
-      .then(validateResponse)
-  );
+  let response;
+  try {
+    response = await callWithRetry(() =>
+      openRouterMessages({ model: currentModel, max_tokens: 4096, system: systemPrompt, tools, messages })
+        .then(validateResponse)
+    );
+  } catch (err) {
+    // If 400 "Invalid message format" — history is corrupted, retry without it
+    if (err.status === 400 && err.message?.includes('Invalid message')) {
+      console.log('400 error from corrupted history — clearing history and retrying without it');
+      await supabase.from('conversation_history').delete()
+        .eq('user_id', userId).eq('bot_name', 'JohnStocky');
+      messages.length = 0;
+      messages.push({ role: 'user', content: userMessage });
+      response = await callWithRetry(() =>
+        openRouterMessages({ model: currentModel, max_tokens: 4096, system: systemPrompt, tools, messages })
+          .then(validateResponse)
+      );
+    } else {
+      throw err;
+    }
+  }
 
   // Tool use loop
   while (response.stop_reason === 'tool_use') {
@@ -1961,7 +2009,7 @@ bot.on('photo', async (ctx) => {
 
     // Call Claude directly with vision
     const history = await getConversationHistory(userId);
-    const messages = history.map(h => ({ role: h.role, content: h.content }));
+    const messages = sanitizeHistory(history);
     messages.push({
       role: 'user',
       content: [
@@ -1970,14 +2018,16 @@ bot.on('photo', async (ctx) => {
       ]
     });
 
-    const aiResponse = await openRouterMessages({
-      model: currentModel,
-      max_tokens: 4096,
-      system: getSystemPrompt(),
-      messages
-    });
+    const aiResponse = await callWithRetry(() =>
+      openRouterMessages({
+        model: currentModel,
+        max_tokens: 4096,
+        system: getSystemPrompt(),
+        messages
+      }).then(validateResponse)
+    );
 
-    const reply = aiResponse.content.map(b => b.text || '').join('');
+    const reply = (aiResponse.content || []).map(b => b.text || '').join('');
 
     // Save to history
     await saveMessage(userId, 'user', `[Image sent] ${caption}`);
