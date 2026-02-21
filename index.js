@@ -960,11 +960,38 @@ async function openRouterChatWithModel(messages, model = 'openai/gpt-4o', temper
   }
 }
 
+// Ensure messages array has valid structure for Anthropic API
+function ensureValidMessages(messages) {
+  if (!messages || messages.length === 0) return messages;
+  const cleaned = [];
+  for (const msg of messages) {
+    if (msg.content == null) continue;
+    if (typeof msg.content === 'string' && !msg.content.trim()) continue;
+    if (Array.isArray(msg.content) && msg.content.length === 0) continue;
+    const role = msg.role === 'assistant' ? 'assistant' : 'user';
+    if (cleaned.length > 0 && cleaned[cleaned.length - 1].role === role) {
+      const prev = cleaned[cleaned.length - 1];
+      if (typeof prev.content === 'string' && typeof msg.content === 'string') {
+        prev.content += '\n\n' + msg.content;
+        continue;
+      }
+      console.log(`Warning: consecutive ${role} messages with mixed content types — skipping duplicate`);
+      continue;
+    }
+    cleaned.push({ role, content: msg.content });
+  }
+  while (cleaned.length > 0 && cleaned[0].role !== 'user') {
+    cleaned.shift();
+  }
+  return cleaned;
+}
+
 async function openRouterMessages({ model, max_tokens, system, tools, messages }) {
   const apiKey = await getOpenRouterKey();
   if (!apiKey) throw new Error('No OpenRouter API key. Use: /setcred OPENROUTER your_key');
 
-  const body = { model: `anthropic/${model}`, max_tokens, system, messages };
+  const validMessages = ensureValidMessages(messages);
+  const body = { model: `anthropic/${model}`, max_tokens, system, messages: validMessages };
   if (tools && tools.length > 0) body.tools = tools;
 
   try {
@@ -979,10 +1006,21 @@ async function openRouterMessages({ model, max_tokens, system, tools, messages }
     });
     return response.data;
   } catch (err) {
-    // Normalize axios errors so retry logic can check err.status
     if (err.response) {
-      const error = new Error(err.response.data?.error?.message || `OpenRouter error ${err.response.status}`);
-      error.status = err.response.status;
+      const status = err.response.status;
+      // Log debug details on 400 errors
+      if (status === 400) {
+        console.log('=== 400 ERROR DEBUG ===');
+        console.log('Error body:', JSON.stringify(err.response.data).substring(0, 500));
+        console.log('Message count:', validMessages.length);
+        console.log('Message roles:', validMessages.map(m => m.role).join(', '));
+        console.log('Message content types:', validMessages.map(m =>
+          `${m.role}:${Array.isArray(m.content) ? `array[${m.content.length}]` : typeof m.content}`
+        ).join(', '));
+        console.log('=== END DEBUG ===');
+      }
+      const error = new Error(err.response.data?.error?.message || `OpenRouter error ${status}`);
+      error.status = status;
       throw error;
     }
     if (err.code === 'ECONNABORTED') {
@@ -1628,8 +1666,11 @@ async function runJohn(userId, userMessage) {
     }
   }
 
-  // Tool use loop
-  while (response.stop_reason === 'tool_use') {
+  // Tool use loop with 400-error recovery
+  let toolLoopCount = 0;
+  const maxToolLoops = 15;
+  while (response.stop_reason === 'tool_use' && toolLoopCount < maxToolLoops) {
+    toolLoopCount++;
     const toolResults = [];
     for (const block of (response.content || []).filter(b => b.type === 'tool_use')) {
       let result;
@@ -1638,19 +1679,38 @@ async function runJohn(userId, userMessage) {
       } catch (err) {
         result = { error: err.message };
       }
+      let resultStr = JSON.stringify(result);
+      if (resultStr.length > 50000) {
+        resultStr = resultStr.substring(0, 50000) + '... [truncated]';
+      }
       toolResults.push({
         type: 'tool_result',
         tool_use_id: block.id,
-        content: JSON.stringify(result)
+        content: resultStr
       });
     }
     messages.push({ role: 'assistant', content: response.content });
     messages.push({ role: 'user', content: toolResults });
 
-    response = await callWithRetry(() =>
-      openRouterMessages({ model: currentModel, max_tokens: 4096, system: systemPrompt, tools, messages })
-        .then(validateResponse)
-    );
+    try {
+      response = await callWithRetry(() =>
+        openRouterMessages({ model: currentModel, max_tokens: 4096, system: systemPrompt, tools, messages })
+          .then(validateResponse)
+      );
+    } catch (err) {
+      if (err.status === 400) {
+        console.log('400 error in tool loop — recovering with tool results summary');
+        const toolSummary = toolResults.map(tr => tr.content.substring(0, 500)).join('\n');
+        messages.length = 0;
+        messages.push({ role: 'user', content: `${userMessage}\n\n[Tool results from previous attempt]:\n${toolSummary}` });
+        response = await callWithRetry(() =>
+          openRouterMessages({ model: currentModel, max_tokens: 4096, system: systemPrompt, messages })
+            .then(validateResponse)
+        );
+        break;
+      }
+      throw err;
+    }
   }
 
   const finalText = (response.content || []).find(b => b.type === 'text')?.text || "Something went wrong!";
