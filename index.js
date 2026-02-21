@@ -1021,6 +1021,16 @@ async function callWithRetry(fn, maxRetries = 3) {
   throw lastError;
 }
 
+// Validate API response has expected structure
+function validateResponse(response) {
+  if (!response || !Array.isArray(response.content)) {
+    const err = new Error(`Invalid API response: ${JSON.stringify(response)?.substring(0, 200)}`);
+    err.status = 502;
+    throw err;
+  }
+  return response;
+}
+
 async function openRouterTranscribeAudio(audioUrl) {
   const apiKey = await getOpenRouterKey();
   if (!apiKey) return { error: 'Need OpenRouter API key. Use: /setcred OPENROUTER your_key' };
@@ -1564,19 +1574,16 @@ async function runJohn(userId, userMessage) {
     { role: 'user', content: userMessage }
   ];
 
-  // Initial API call with retry
-  let response = await callWithRetry(() => openRouterMessages({
-    model: currentModel,
-    max_tokens: 4096,
-    system: systemPrompt,
-    tools,
-    messages
-  }));
+  // Initial API call with retry + validation
+  let response = await callWithRetry(() =>
+    openRouterMessages({ model: currentModel, max_tokens: 4096, system: systemPrompt, tools, messages })
+      .then(validateResponse)
+  );
 
   // Tool use loop
   while (response.stop_reason === 'tool_use') {
     const toolResults = [];
-    for (const block of response.content.filter(b => b.type === 'tool_use')) {
+    for (const block of (response.content || []).filter(b => b.type === 'tool_use')) {
       let result;
       try {
         result = await processTool(block.name, block.input, userId);
@@ -1592,16 +1599,13 @@ async function runJohn(userId, userMessage) {
     messages.push({ role: 'assistant', content: response.content });
     messages.push({ role: 'user', content: toolResults });
 
-    response = await callWithRetry(() => openRouterMessages({
-      model: currentModel,
-      max_tokens: 4096,
-      system: systemPrompt,
-      tools,
-      messages
-    }));
+    response = await callWithRetry(() =>
+      openRouterMessages({ model: currentModel, max_tokens: 4096, system: systemPrompt, tools, messages })
+        .then(validateResponse)
+    );
   }
 
-  const finalText = response.content.find(b => b.type === 'text')?.text || "Something went wrong!";
+  const finalText = (response.content || []).find(b => b.type === 'text')?.text || "Something went wrong!";
   await saveMessage(userId, 'user', userMessage);
   await saveMessage(userId, 'assistant', finalText);
   return finalText;
