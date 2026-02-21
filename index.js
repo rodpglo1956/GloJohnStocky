@@ -12,7 +12,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const github = new Octokit({ auth: process.env.GITHUB_TOKEN });
 
 // Model switcher
-let currentModel = 'claude-sonnet-4-5-20250929';
+let currentModel = 'claude-sonnet-4.5';
 
 // Browser instances
 let browser = null;
@@ -960,6 +960,32 @@ async function openRouterChatWithModel(messages, model = 'openai/gpt-4o', temper
   }
 }
 
+// Strip content blocks to ONLY valid Anthropic API fields.
+// OpenRouter may add extra fields that cause 400 errors when echoed back.
+function sanitizeContentBlocks(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return content;
+
+  return content.map(block => {
+    if (block.type === 'text') {
+      return { type: 'text', text: block.text };
+    }
+    if (block.type === 'tool_use') {
+      return { type: 'tool_use', id: block.id, name: block.name, input: block.input };
+    }
+    if (block.type === 'tool_result') {
+      const sanitized = { type: 'tool_result', tool_use_id: block.tool_use_id, content: block.content };
+      if (block.is_error === true) sanitized.is_error = true;
+      return sanitized;
+    }
+    if (block.type === 'image') {
+      return { type: 'image', source: block.source };
+    }
+    console.log(`Warning: unknown content block type "${block.type}" — passing through as-is`);
+    return block;
+  });
+}
+
 // Ensure messages array has valid structure for Anthropic API
 function ensureValidMessages(messages) {
   if (!messages || messages.length === 0) return messages;
@@ -975,10 +1001,11 @@ function ensureValidMessages(messages) {
         prev.content += '\n\n' + msg.content;
         continue;
       }
-      console.log(`Warning: consecutive ${role} messages with mixed content types — skipping duplicate`);
+      console.log(`Warning: consecutive ${role} messages with mixed content types — replacing previous with current`);
+      cleaned[cleaned.length - 1].content = sanitizeContentBlocks(msg.content);
       continue;
     }
-    cleaned.push({ role, content: msg.content });
+    cleaned.push({ role, content: sanitizeContentBlocks(msg.content) });
   }
   while (cleaned.length > 0 && cleaned[0].role !== 'user') {
     cleaned.shift();
@@ -1011,12 +1038,23 @@ async function openRouterMessages({ model, max_tokens, system, tools, messages }
       // Log debug details on 400 errors
       if (status === 400) {
         console.log('=== 400 ERROR DEBUG ===');
-        console.log('Error body:', JSON.stringify(err.response.data).substring(0, 500));
+        console.log('Error body:', JSON.stringify(err.response.data).substring(0, 1000));
+        console.log('Model:', body.model);
         console.log('Message count:', validMessages.length);
         console.log('Message roles:', validMessages.map(m => m.role).join(', '));
         console.log('Message content types:', validMessages.map(m =>
-          `${m.role}:${Array.isArray(m.content) ? `array[${m.content.length}]` : typeof m.content}`
+          `${m.role}:${Array.isArray(m.content) ? `array[${m.content.length}](${m.content.map(b => b.type).join(',')})` : typeof m.content}`
         ).join(', '));
+        const last3 = validMessages.slice(-3);
+        for (let i = 0; i < last3.length; i++) {
+          const m = last3[i];
+          const contentStr = typeof m.content === 'string'
+            ? m.content.substring(0, 300)
+            : JSON.stringify(m.content).substring(0, 500);
+          console.log(`  msg[-${last3.length - i}] ${m.role}: ${contentStr}`);
+        }
+        const bodyStr = JSON.stringify(body);
+        console.log('Request body tail:', bodyStr.substring(Math.max(0, bodyStr.length - 2000)));
         console.log('=== END DEBUG ===');
       }
       const error = new Error(err.response.data?.error?.message || `OpenRouter error ${status}`);
@@ -1689,8 +1727,8 @@ async function runJohn(userId, userMessage) {
         content: resultStr
       });
     }
-    messages.push({ role: 'assistant', content: response.content });
-    messages.push({ role: 'user', content: toolResults });
+    messages.push({ role: 'assistant', content: sanitizeContentBlocks(response.content) });
+    messages.push({ role: 'user', content: sanitizeContentBlocks(toolResults) });
 
     try {
       response = await callWithRetry(() =>
@@ -1794,12 +1832,12 @@ bot.use((ctx, next) => {
 
 // Commands
 bot.command('opus', (ctx) => {
-  currentModel = 'claude-opus-4-5-20251101';
+  currentModel = 'claude-opus-4.5';
   ctx.reply("Opus mode activated 🔥");
 });
 
 bot.command('sonnet', (ctx) => {
-  currentModel = 'claude-sonnet-4-5-20250929';
+  currentModel = 'claude-sonnet-4.5';
   ctx.reply("Sonnet mode ✅");
 });
 
